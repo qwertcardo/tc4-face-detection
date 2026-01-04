@@ -1,0 +1,13 @@
+services:
+  python:
+    image: pci
+    container_name: pci
+    command: tail -f /dev/null
+    volumes:
+      - /mnt/c/Projects/Python/TC4:/workspace
+    working_dir: /workspace
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
