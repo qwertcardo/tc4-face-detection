@@ -32,7 +32,7 @@ from mediapipe.tasks.python import vision
 # -----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_PATH = os.path.join(BASE_DIR, "../assets", "video.mp4")
-OUTPUT_PATH = os.path.join(BASE_DIR, "../assets", "output", "output_2.mp4")
+OUTPUT_PATH = os.path.join(BASE_DIR, "../assets", "output", "output_with_emotion_1.mp4")
 MODEL_PATH = os.path.join(BASE_DIR, "../models", "face_landmarker.task")
 
 
@@ -204,6 +204,7 @@ class FaceState:
     # ReID
     embedding: np.ndarray | None = None
     last_embed_frame: int = -9999
+    last_emotion: str | None = None
 
 
 def update_eyes_state(state: FaceState, ear_raw: float) -> float:
@@ -258,6 +259,30 @@ def is_hard_cut(prev_gray_small, gray_small, thr=18.0):
     # diff médio absoluto
     diff = cv2.absdiff(prev_gray_small, gray_small)
     return float(diff.mean()) > thr
+
+def get_emotion_from_roi(roi_bgr):
+    try:
+        analysis = DeepFace.analyze(
+            img_path=roi_bgr,
+            actions=["emotion"],
+            detector_backend="skip",
+            enforce_detection=False
+        )
+    except Exception:
+        return None
+
+    if isinstance(analysis, list) and analysis:
+        analysis = analysis[0]
+
+    emotions = analysis.get("emotion") if isinstance(analysis, dict) else None
+    if emotions:
+        # retorna a emoção com maior probabilidade
+        return max(emotions, key=emotions.get)
+
+    if isinstance(analysis, dict):
+        return analysis.get("dominant_emotion")
+
+    return None
 
 # -----------------------------
 # Tracker ReID (IoU + embedding)
@@ -435,7 +460,7 @@ def main():
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
-        num_faces=1,  # você roda por ROI
+        num_faces=1, # sempre processando só um rosto (ROI)
         output_face_blendshapes=False,
         output_facial_transformation_matrixes=False,
     )
@@ -459,9 +484,9 @@ def main():
 
     tracker = ReIDTracker(
         iou_thr=0.25,
-        sim_thr=0.55,            # ajuste: 0.50-0.65 costuma ser um range bom
+        sim_thr=0.55,
         max_missed=25,
-        embed_every_n_frames=10, # (não usamos aqui por frame, mas fica pronto p/ evoluir)
+        embed_every_n_frames=10,
         model_name="Facenet512"
     )
 
@@ -521,16 +546,21 @@ def main():
                 ear_raw = (left_ear + right_ear) / 2.0
                 ear = update_eyes_state(state, ear_raw)
 
+                emotion = get_emotion_from_roi(roi_bgr)
+                if emotion:
+                    state.last_emotion = emotion
+                emotion_txt = state.last_emotion if state.last_emotion else "?"
+
                 # Desenha pontos dos olhos (verde)
                 draw_points_global(frame, lms, LEFT_EYE_IDX, roi_x1, roi_y1, roi_w, roi_h, (0, 255, 0), radius=2)
                 draw_points_global(frame, lms, RIGHT_EYE_IDX, roi_x1, roi_y1, roi_w, roi_h, (0, 255, 0), radius=2)
 
                 eyes_txt = "CLOSED" if state.eyes_closed else "OPEN"
-                label = f"ID {face_id}  eyes: {eyes_txt}  EAR:{ear:.3f}"
+                label = f"ID {face_id}  eyes: {eyes_txt}  EAR:{ear:.3f} emotion: {emotion_txt}"
                 cv2.putText(frame, label, (x1, max(20, y1 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
-            # Debug/visual: desenha TODOS os boxes do merge (independente de tracking/mediapipe)
+            # Debug/visual
             for (mx1, my1, mx2, my2, mscore) in combined:
                 cv2.rectangle(frame, (mx1, my1), (mx2, my2), (0, 255, 0), 2)
 
