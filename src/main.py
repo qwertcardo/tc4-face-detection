@@ -2,18 +2,16 @@
 Versão final (multi-rostos) — Dlib + RetinaFace (DeepFace) para boxes,
 MediaPipe Tasks (FaceLandmarker) para landmarks, com:
 
-- Tracking por IoU (IDs persistentes)
-- Contagem de piscadas por ID (EAR com EMA + histerese)
-- Contagem de aberturas de boca por ID (MAR com EMA + histerese)
-- Desenho: caixa do rosto + pontos dos olhos e boca + texto por rosto
-- Suporte a múltiplos rostos no mesmo vídeo
+- Tracking por rosto (ReID): IoU + embedding (DeepFace.represent)
+- Estado dos olhos por ID: OPEN/CLOSED (EAR com EMA + histerese)
+- Desenho: caixa + pontos dos olhos + label por rosto
+- Timestamp monotônico no MediaPipe (VIDEO mode)
 
 Dependências:
   pip install opencv-python mediapipe numpy tqdm deepface dlib
 
 Modelo:
-  baixe e coloque o FaceLandmarker .task em:
-    models/face_landmarker.task
+  models/face_landmarker.task
 """
 
 import os
@@ -22,7 +20,6 @@ import dlib
 import numpy as np
 from tqdm import tqdm
 from dataclasses import dataclass
-
 from deepface import DeepFace
 
 import mediapipe as mp
@@ -34,33 +31,19 @@ from mediapipe.tasks.python import vision
 # Paths
 # -----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VIDEO_PATH = os.path.join(BASE_DIR, "assets", "video.mp4")
-OUTPUT_PATH = os.path.join(BASE_DIR, "assets", "output", "output_1.mp4")
-MODEL_PATH = os.path.join(BASE_DIR, "models", "face_landmarker.task")
+VIDEO_PATH = os.path.join(BASE_DIR, "../assets", "video.mp4")
+OUTPUT_PATH = os.path.join(BASE_DIR, "../assets", "output", "output_2.mp4")
+MODEL_PATH = os.path.join(BASE_DIR, "../models", "face_landmarker.task")
 
 
 # -----------------------------
 # FaceMesh indices (olhos/boca)
 # -----------------------------
-# Para desenhar (conjuntos maiores):
 LEFT_EYE_IDX = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE_IDX = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
-MOUTH_IDX = [
-    61, 146, 91, 181, 84, 17, 314, 405, 321, 375,
-    291, 308, 324, 318, 402, 317, 14, 87, 178, 88,
-    95, 185, 40, 39, 37, 0, 267, 269, 270, 409,
-    415, 310, 311, 312, 13, 82, 81, 42, 183, 78
-]
 
-# Para EAR (6 pontos):
 LEFT_EAR_IDX  = [33, 160, 158, 133, 153, 144]   # p1,p2,p3,p4,p5,p6
 RIGHT_EAR_IDX = [362, 385, 387, 263, 373, 380]  # p1,p2,p3,p4,p5,p6
-
-# Para MAR (4 pontos):
-MOUTH_LEFT = 61
-MOUTH_RIGHT = 291
-MOUTH_UP = 13
-MOUTH_DOWN = 14
 
 
 # -----------------------------
@@ -89,14 +72,13 @@ def iou(a, b):
 def clip_box(x1, y1, x2, y2, W, H):
     x1 = max(0, min(int(x1), W - 1))
     y1 = max(0, min(int(y1), H - 1))
-    x2 = max(1, min(int(x2), W))   # exclusivo
-    y2 = max(1, min(int(y2), H))   # exclusivo
+    x2 = max(1, min(int(x2), W))
+    y2 = max(1, min(int(y2), H))
     if x2 <= x1:
         x2 = min(W, x1 + 1)
     if y2 <= y1:
         y2 = min(H, y1 + 1)
     return x1, y1, x2, y2
-
 
 def square_expand_box(x1, y1, x2, y2, W, H, scale=1.25):
     cx = (x1 + x2) / 2.0
@@ -109,7 +91,6 @@ def square_expand_box(x1, y1, x2, y2, W, H, scale=1.25):
     nx2 = cx + side / 2
     ny2 = cy + side / 2
     return clip_box(nx1, ny1, nx2, ny2, W, H)
-
 
 # -----------------------------
 # Detecção de faces: RetinaFace (DeepFace) + Dlib
@@ -138,6 +119,24 @@ def dlib_boxes(gray_frame, detector, upsample=0):
         out.append((r.left(), r.top(), r.right() + 1, r.bottom() + 1, None))
     return out
 
+
+def filter_boxes(boxes, W, H, max_area_ratio=0.60):
+    out = []
+    frame_area = float(W * H)
+
+    for (x1, y1, x2, y2, score) in boxes:
+        bw = max(0, x2 - x1)
+        bh = max(0, y2 - y1)
+        if bw == 0 or bh == 0:
+            continue
+
+        area_ratio = (bw * bh) / frame_area
+        if area_ratio >= max_area_ratio:
+            continue
+
+        out.append((x1, y1, x2, y2, score))
+
+    return out
 
 def merge_boxes(dlib_list, retina_list, iou_thr=0.4):
     """
@@ -173,7 +172,7 @@ def merge_boxes(dlib_list, retina_list, iou_thr=0.4):
 
 
 # -----------------------------
-# EAR / MAR
+# EAR
 # -----------------------------
 def ear_from_landmarks(landmarks, eye_idx, w, h):
     pts = []
@@ -188,113 +187,26 @@ def ear_from_landmarks(landmarks, eye_idx, w, h):
     return 0.0 if C == 0 else (A + B) / (2.0 * C)
 
 
-def mar_from_landmarks(landmarks, w, h):
-    def pt(i):
-        return np.array([landmarks[i].x * w, landmarks[i].y * h], dtype=np.float32)
-
-    left = pt(MOUTH_LEFT)
-    right = pt(MOUTH_RIGHT)
-    up = pt(MOUTH_UP)
-    down = pt(MOUTH_DOWN)
-
-    horiz = np.linalg.norm(right - left)
-    vert = np.linalg.norm(down - up)
-    return 0.0 if horiz == 0 else vert / horiz
-
-
 # -----------------------------
-# Tracker IoU + Estado por rosto
+# Olhos: EMA + histerese (sem contagem)
 # -----------------------------
-@dataclass
-class FaceState:
-    # Blink
-    blinks: int = 0
-    closed_frames: int = 0
-    was_closed: bool = False
-    ear_ema: float = 0.0
-
-    # Mouth open
-    mouth_opens: int = 0
-    open_frames: int = 0
-    was_open: bool = False
-    mar_ema: float = 0.0
-
-    last_seen: int = 0
-
-
-class IoUTracker:
-    def __init__(self, iou_thr=0.3, max_missed=15):
-        self.iou_thr = iou_thr
-        self.max_missed = max_missed
-        self.next_id = 1
-        self.tracks = {}   # id -> (box(x1,y1,x2,y2), missed)
-        self.states = {}   # id -> FaceState
-
-    def update(self, boxes, frame_idx):
-        # boxes: [(x1,y1,x2,y2,score), ...]
-        assigned = {}
-        used_track_ids = set()
-
-        # Match detections -> existing tracks
-        for b in boxes:
-            x1, y1, x2, y2, _ = b
-            best_id = None
-            best = 0.0
-
-            for tid, (tbox, missed) in self.tracks.items():
-                if tid in used_track_ids:
-                    continue
-                v = iou((x1, y1, x2, y2), tbox)
-                if v > best:
-                    best = v
-                    best_id = tid
-
-            if best_id is not None and best >= self.iou_thr:
-                assigned[best_id] = b
-                used_track_ids.add(best_id)
-            else:
-                tid = self.next_id
-                self.next_id += 1
-                assigned[tid] = b
-                used_track_ids.add(tid)
-
-        # Build new tracks, reset missed
-        new_tracks = {}
-        for tid, b in assigned.items():
-            x1, y1, x2, y2, _ = b
-            new_tracks[tid] = ((x1, y1, x2, y2), 0)
-            if tid not in self.states:
-                self.states[tid] = FaceState()
-            self.states[tid].last_seen = frame_idx
-
-        # Carry over unmatched old tracks (increment missed)
-        for tid, (tbox, missed) in self.tracks.items():
-            if tid not in new_tracks:
-                missed += 1
-                if missed <= self.max_missed:
-                    new_tracks[tid] = (tbox, missed)
-
-        self.tracks = new_tracks
-        return assigned  # dict: id -> box(x1,y1,x2,y2,score)
-
-
-# -----------------------------
-# Atualizações robustas (EMA + histerese)
-# -----------------------------
-# Blink (ajuste se necessário)
 EAR_CLOSE = 0.21
-EAR_OPEN = 0.24
-MIN_CLOSED_FRAMES = 2
+EAR_OPEN  = 0.24
 EAR_EMA_ALPHA = 0.35
 
-# Mouth (ajuste se necessário)
-MAR_OPEN = 0.35
-MAR_CLOSE = 0.30
-MIN_OPEN_FRAMES = 2
-MAR_EMA_ALPHA = 0.35
+
+@dataclass
+class FaceState:
+    ear_ema: float = 0.0
+    eyes_closed: bool = False   # estado final (histerese)
+    last_seen: int = 0
+
+    # ReID
+    embedding: np.ndarray | None = None
+    last_embed_frame: int = -9999
 
 
-def update_blink(state: FaceState, ear_raw: float) -> float:
+def update_eyes_state(state: FaceState, ear_raw: float) -> float:
     if state.ear_ema == 0.0:
         state.ear_ema = ear_raw
     else:
@@ -302,40 +214,207 @@ def update_blink(state: FaceState, ear_raw: float) -> float:
 
     ear = state.ear_ema
 
-    if ear < EAR_CLOSE:
-        state.closed_frames += 1
-        state.was_closed = True
-    elif ear > EAR_OPEN:
-        if state.was_closed and state.closed_frames >= MIN_CLOSED_FRAMES:
-            state.blinks += 1
-        state.closed_frames = 0
-        state.was_closed = False
+    # Histerese: só muda quando cruza o limiar oposto
+    if state.eyes_closed:
+        if ear > EAR_OPEN:
+            state.eyes_closed = False
+    else:
+        if ear < EAR_CLOSE:
+            state.eyes_closed = True
 
     return ear
 
 
-def update_mouth(state: FaceState, mar_raw: float) -> float:
-    if state.mar_ema == 0.0:
-        state.mar_ema = mar_raw
-    else:
-        state.mar_ema = MAR_EMA_ALPHA * mar_raw + (1.0 - MAR_EMA_ALPHA) * state.mar_ema
+# -----------------------------
+# DeepFace embedding (ReID)
+# -----------------------------
+def get_embedding_from_roi(roi_bgr, model_name="Facenet512"):
+    """
+    Retorna embedding L2-normalizado (np.ndarray shape (d,))
+    """
+    try:
+        reps = DeepFace.represent(
+            img_path=roi_bgr,
+            model_name=model_name,
+            detector_backend="skip",     # ROI já é o rosto
+            enforce_detection=False,
+            normalization="base"
+        )
+        if not reps:
+            return None
+        emb = np.array(reps[0]["embedding"], dtype=np.float32)
+        n = np.linalg.norm(emb)
+        return emb if n == 0 else emb / n
+    except Exception:
+        return None
 
-    mar = state.mar_ema
 
-    if mar > MAR_OPEN:
-        state.open_frames += 1
-        state.was_open = True
-    elif mar < MAR_CLOSE:
-        if state.was_open and state.open_frames >= MIN_OPEN_FRAMES:
-            state.mouth_opens += 1
-        state.open_frames = 0
-        state.was_open = False
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    if a is None or b is None:
+        return -1.0
+    return float(np.dot(a, b))
 
-    return mar
+def is_hard_cut(prev_gray_small, gray_small, thr=18.0):
+    # diff médio absoluto
+    diff = cv2.absdiff(prev_gray_small, gray_small)
+    return float(diff.mean()) > thr
+
+# -----------------------------
+# Tracker ReID (IoU + embedding)
+# -----------------------------
+class ReIDTracker:
+    def __init__(
+        self,
+        iou_thr=0.25,
+        sim_thr=0.55,
+        max_missed=20,
+        embed_every_n_frames=10,
+        model_name="Facenet512"
+    ):
+        self.iou_thr = iou_thr
+        self.sim_thr = sim_thr
+        self.max_missed = max_missed
+        self.embed_every_n_frames = embed_every_n_frames
+        self.model_name = model_name
+
+        self.next_id = 1
+        self.tracks = {}  # id -> (box(x1,y1,x2,y2), missed)
+        self.states = {}  # id -> FaceState
+
+    def _ensure_state(self, tid):
+        if tid not in self.states:
+            self.states[tid] = FaceState()
+
+    def update(self, detections, frame, frame_idx, W, H):
+        """
+        detections: list[(x1,y1,x2,y2,score)]
+        retorna: dict[id] -> (x1,y1,x2,y2,score)
+        """
+        assigned = {}
+        used_track_ids = set()
+
+        # Pré-calcula ROI e embedding para detecções (somente quando necessário)
+        det_infos = []
+        for (x1, y1, x2, y2, score) in detections:
+            # filtro básico (mantém seu comportamento)
+            if score is not None and score < 0.6:
+                continue
+            if (x2 - x1) < 60 or (y2 - y1) < 60:
+                continue
+
+            roi_x1, roi_y1, roi_x2, roi_y2 = square_expand_box(x1, y1, x2, y2, W, H, scale=1.25)
+            roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+            if roi.size == 0:
+                continue
+
+            det_infos.append({
+                "box": (x1, y1, x2, y2),
+                "score": score,
+                "roi_box": (roi_x1, roi_y1, roi_x2, roi_y2),
+                "roi": roi,
+                "emb": None,
+            })
+
+        # Matching: para cada detecção, tenta:
+        # 1) IoU forte -> mesmo ID
+        # 2) senão, embedding parecido -> mesmo ID (ReID)
+        for det in det_infos:
+            x1, y1, x2, y2 = det["box"]
+
+            best_id = None
+            best_iou = 0.0
+
+            # 1) IoU match
+            for tid, (tbox, missed) in self.tracks.items():
+                if tid in used_track_ids:
+                    continue
+                v = iou((x1, y1, x2, y2), tbox)
+                if v > best_iou:
+                    best_iou = v
+                    best_id = tid
+
+            if best_id is not None and best_iou >= self.iou_thr:
+                # match por IoU
+                tid = best_id
+                assigned[tid] = (x1, y1, x2, y2, det["score"], det["roi_box"], det["roi"])
+                used_track_ids.add(tid)
+                self._ensure_state(tid)
+                self.states[tid].last_seen = frame_idx
+                continue
+
+            # 2) ReID match (embedding)
+            # calcula embedding da detecção
+            det["emb"] = get_embedding_from_roi(det["roi"], model_name=self.model_name)
+
+            best_tid = None
+            best_sim = -1.0
+            for tid, (tbox, missed) in self.tracks.items():
+                if tid in used_track_ids:
+                    continue
+                self._ensure_state(tid)
+                st = self.states[tid]
+                if st.embedding is None or det["emb"] is None:
+                    continue
+                sim = cosine_sim(det["emb"], st.embedding)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_tid = tid
+
+            if best_tid is not None and best_sim >= self.sim_thr:
+                tid = best_tid
+                assigned[tid] = (x1, y1, x2, y2, det["score"], det["roi_box"], det["roi"])
+                used_track_ids.add(tid)
+                self.states[tid].last_seen = frame_idx
+
+                # opcional: atualiza embedding do track com o da detecção (média móvel simples)
+                st = self.states[tid]
+                if det["emb"] is not None:
+                    if st.embedding is None:
+                        st.embedding = det["emb"]
+                    else:
+                        st.embedding = st.embedding * 0.7 + det["emb"] * 0.3
+                        n = np.linalg.norm(st.embedding)
+                        if n != 0:
+                            st.embedding = st.embedding / n
+                continue
+
+            # 3) novo ID
+            tid = self.next_id
+            self.next_id += 1
+            assigned[tid] = (x1, y1, x2, y2, det["score"], det["roi_box"], det["roi"])
+            used_track_ids.add(tid)
+            self._ensure_state(tid)
+            self.states[tid].last_seen = frame_idx
+
+            # guarda embedding inicial, se houver
+            st = self.states[tid]
+            st.embedding = det["emb"]
+
+        # Atualiza tracks: reset missed para assigned, incrementa missed para os demais
+        new_tracks = {}
+        for tid, (x1, y1, x2, y2, score, roi_box, roi) in assigned.items():
+            new_tracks[tid] = ((x1, y1, x2, y2), 0)
+
+        for tid, (tbox, missed) in self.tracks.items():
+            if tid not in new_tracks:
+                missed += 1
+                if missed <= self.max_missed:
+                    new_tracks[tid] = (tbox, missed)
+
+        self.tracks = new_tracks
+
+        # Retorna só (id -> box+roi)
+        return assigned
+
+    def reset_tracks(self, keep_states=False):
+        self.tracks = {}
+        if not keep_states:
+            self.states = {}
+        self.next_id = 1 if not keep_states else self.next_id
 
 
 # -----------------------------
-# Desenho no frame global
+# Desenho
 # -----------------------------
 def draw_points_global(frame, landmarks, idx_list, roi_x1, roi_y1, roi_w, roi_h, color, radius=2):
     for idx in idx_list:
@@ -352,18 +431,16 @@ def main():
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(f"Modelo .task não encontrado em: {MODEL_PATH}")
 
-    # MediaPipe Tasks - FaceLandmarker (VIDEO)
     base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
         running_mode=vision.RunningMode.VIDEO,
-        num_faces=1,
+        num_faces=1,  # você roda por ROI
         output_face_blendshapes=False,
         output_facial_transformation_matrixes=False,
     )
     mediapipe_detector = vision.FaceLandmarker.create_from_options(options)
 
-    # Detectores de boxes
     dlib_detector = dlib.get_frontal_face_detector()
 
     cap = cv2.VideoCapture(VIDEO_PATH)
@@ -375,63 +452,63 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
 
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(OUTPUT_PATH, fourcc, fps, (width, height))
 
-    tracker = IoUTracker(iou_thr=0.3, max_missed=15)
+    tracker = ReIDTracker(
+        iou_thr=0.25,
+        sim_thr=0.55,            # ajuste: 0.50-0.65 costuma ser um range bom
+        max_missed=25,
+        embed_every_n_frames=10, # (não usamos aqui por frame, mas fica pronto p/ evoluir)
+        model_name="Facenet512"
+    )
 
+    prev_small = None
     frame_idx = 0
-    ts_count = 0;
+    mp_ts = 0  # timestamp monotônico do MediaPipe (1 por chamada)
     with tqdm(total=total_frames if total_frames > 0 else None, desc="Processando", unit="frame") as pbar:
         while True:
-            ts_count += 1
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # timestamp em ms (base do VIDEO mode)
-            timestamp_ms = int(cap.get(cv2.CAP_PROP_POS_MSEC) + ts_count)
-
-            # 1) Boxes por RetinaFace + Dlib
             retina_boxes = deepface_retina_boxes(frame)
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            small = cv2.resize(gray, (160, 90))
+            cut = False
+            if prev_small is not None:
+                cut = is_hard_cut(prev_small, small, thr=18.0)
+            prev_small = small
+            if cut:
+                tracker.reset_tracks(keep_states=False)  # ou True, depende do que você quer
+
             dlib_faces = dlib_boxes(gray, dlib_detector)
 
             combined = merge_boxes(dlib_faces, retina_boxes, iou_thr=0.4)
+            # Remove fallback de frames sem deteção de rosto para nao printar uma ROI da tela inteira para o mediapipe
+            combined = filter_boxes(combined, width, height)
 
-            # 2) Tracking (IDs)
-            assigned = tracker.update(combined, frame_idx)
+            # Tracking + ReID (retorna também ROI recortada pra evitar recortar 2x)
+            assigned = tracker.update(combined, frame, frame_idx, width, height)
 
-            # 3) Para cada rosto (por ID), roda landmarks na ROI e atualiza contadores por ID
-            for face_id, (x1, y1, x2, y2, score) in assigned.items():
-                # filtro de score (RetinaFace). Se score None (dlib), aceita.
-                if score is not None and score < 0.6:
-                    continue
-
-                # evita ROIs minúsculas (landmarks ficam instáveis)
-                if (x2 - x1) < 60 or (y2 - y1) < 60:
-                    continue
-
-                roi_x1, roi_y1, roi_x2, roi_y2 = square_expand_box(x1, y1, x2, y2, width, height, scale=1.25)
-                roi_bgr = frame[roi_y1:roi_y2, roi_x1:roi_x2]
-                if roi_bgr.size == 0:
-                    continue
+            # Iteração estável (ID ordenado)
+            for face_id in sorted(assigned.keys()):
+                x1, y1, x2, y2, score, (roi_x1, roi_y1, roi_x2, roi_y2), roi_bgr = assigned[face_id]
 
                 roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
                 mp_roi = mp.Image(image_format=mp.ImageFormat.SRGB, data=roi_rgb)
 
-                # Garantir monotonicidade mesmo com múltiplas ROIs no mesmo frame:
-                # (timestamp_ms + face_id) mantém crescimento ao longo do vídeo
-                result = mediapipe_detector.detect_for_video(mp_roi, timestamp_ms + face_id)
-
-                # Desenha box do detector (verde)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                # timestamp monotônico (corrige o ValueError)
+                mp_ts += 1
+                result = mediapipe_detector.detect_for_video(mp_roi, mp_ts)
 
                 state = tracker.states[face_id]
 
                 if not result.face_landmarks:
-                    cv2.putText(frame, f"ID {face_id} (sem landmarks)", (x1, max(20, y1 - 8)),
+                    cv2.putText(frame, f"ID {face_id}  eyes: ?", (x1, max(20, y1 - 8)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                     continue
 
@@ -439,28 +516,25 @@ def main():
                 roi_w = roi_x2 - roi_x1
                 roi_h = roi_y2 - roi_y1
 
-                # EAR / MAR raw
                 left_ear = ear_from_landmarks(lms, LEFT_EAR_IDX, roi_w, roi_h)
                 right_ear = ear_from_landmarks(lms, RIGHT_EAR_IDX, roi_w, roi_h)
                 ear_raw = (left_ear + right_ear) / 2.0
-                mar_raw = mar_from_landmarks(lms, roi_w, roi_h)
+                ear = update_eyes_state(state, ear_raw)
 
-                # Atualiza estados (EMA + histerese)
-                ear = update_blink(state, ear_raw)
-                mar = update_mouth(state, mar_raw)
-
-                # Desenha landmarks (olhos verdes, boca vermelha)
+                # Desenha pontos dos olhos (verde)
                 draw_points_global(frame, lms, LEFT_EYE_IDX, roi_x1, roi_y1, roi_w, roi_h, (0, 255, 0), radius=2)
                 draw_points_global(frame, lms, RIGHT_EYE_IDX, roi_x1, roi_y1, roi_w, roi_h, (0, 255, 0), radius=2)
-                draw_points_global(frame, lms, MOUTH_IDX, roi_x1, roi_y1, roi_w, roi_h, (0, 0, 255), radius=2)
 
-                # HUD por face
-                label = f"ID {face_id}  blinks:{state.blinks}  EAR:{ear:.3f}  mouth:{state.mouth_opens}  MAR:{mar:.3f}"
+                eyes_txt = "CLOSED" if state.eyes_closed else "OPEN"
+                label = f"ID {face_id}  eyes: {eyes_txt}  EAR:{ear:.3f}"
                 cv2.putText(frame, label, (x1, max(20, y1 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
-            out.write(frame)
+            # Debug/visual: desenha TODOS os boxes do merge (independente de tracking/mediapipe)
+            for (mx1, my1, mx2, my2, mscore) in combined:
+                cv2.rectangle(frame, (mx1, my1), (mx2, my2), (0, 255, 0), 2)
 
+            out.write(frame)
             frame_idx += 1
             pbar.update(1)
 
@@ -469,13 +543,7 @@ def main():
     cv2.destroyAllWindows()
     mediapipe_detector.close()
 
-    # Resumo final (por ID que ainda existe no tracker.states)
-    # Observação: IDs podem “sumir” se rostos saírem do frame; o estado fica no dict até acabar o vídeo.
-    print("Resumo por rosto (ID):")
-    for face_id, st in sorted(tracker.states.items(), key=lambda x: x[0]):
-        print(f"  ID {face_id}: blinks={st.blinks}, mouth_opens={st.mouth_opens}")
-
-    print(f"\nVídeo salvo em: {OUTPUT_PATH}")
+    print(f"Vídeo salvo em: {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
